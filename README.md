@@ -32,7 +32,7 @@ First message per channel is slow (~15-30s, spawning claude). Subsequent message
 ```
 [curl / Shortcut / Telegram / SMS / ...]
     → adapter (translates channel protocol → internal API)
-        → ProcessManager.send(channel, text)
+        → ProcessManager.send(channel, content, context?)
             → session host (detached process per channel)
                 → persistent claude process
         ← { text, duration_ms }
@@ -44,9 +44,10 @@ src/
   index.ts                 # Entry point: Express server, Telegram bot, signals, self-restart
   config.ts                # Env var loading with defaults and type conversion
   core/
-    types.ts               # Protocol types (ClaudeInput, ClaudeResultEvent, etc.)
+    types.ts               # Protocol types (ClaudeInput, ClaudeEvent, ChannelContext, etc.)
     session-host.ts        # Detached process holding a single Claude session, communicates via Unix socket
     process-manager.ts     # THE core — manages channels, spawns/connects session hosts, FIFO dispatch
+    push-registry.ts       # Routes outbound push messages (POST /send) to the right adapter
   adapters/
     http.ts                # POST /message, POST /restart, optional Bearer auth
     telegram.ts            # Telegraf bot, long polling, required user allowlist
@@ -56,7 +57,7 @@ src/
 
 **Session hosts** are detached processes that each hold a single Claude session. They communicate with ProcessManager via Unix domain sockets and survive server hot reloads — only a full shutdown (Ctrl+C / SIGINT) kills them.
 
-**Adapters** are thin. Their only jobs are: (1) derive a channel key from the protocol's natural session boundary, (2) call `processManager.send(channel, text)`, and (3) format the response for the client. Adapters must not implement their own queuing, session management, or concurrency control — ProcessManager owns all of that.
+**Adapters** are thin. Their only jobs are: (1) derive a channel key from the protocol's natural session boundary, (2) build a `ChannelContext` with adapter metadata, (3) call `processManager.send(channel, content, context)`, and (4) format the response for the client. Adapters must not implement their own queuing, session management, or concurrency control — ProcessManager owns all of that.
 
 ## Channels
 
@@ -85,6 +86,8 @@ Adapters derive channel keys from whatever their natural session boundary is. Th
 |---------|------------|--------------|
 | HTTP | Caller-controlled via `channel` field. Defaults to `"http"`. | Request body |
 | Telegram | `tg-<chatId>` | `ctx.chat.id` |
+
+> **Pro tip:** Telegram supergroups with **Topics** enabled give you multiple independent Claude sessions in one group. Each topic is a separate conversation thread — create topics like "Code Review", "Research", "Ops" and each gets its own persistent session with isolated context. Currently all topics in a group share one channel (keyed by chat ID), but this is a natural extension point: key on `chatId-threadId` to get per-topic sessions.
 
 ## Concurrency model
 
@@ -123,19 +126,20 @@ Adapters check `response.coalesced` and skip sending a response for those messag
 Adapters are intentionally thin. Here's the contract:
 
 1. **Derive a channel key** from the protocol's natural session boundary. Prefix it with an adapter identifier (e.g., `ws-`, `discord-`). See channel key conventions above.
-2. **Call `processManager.send(channel, text)`** and await the result. That's it for the core interaction — ProcessManager handles spawning, queuing, session persistence, and reconnection.
-3. **Do not implement your own queuing or concurrency control.** ProcessManager owns all of that. If two messages arrive simultaneously for the same channel, both `send()` calls will resolve correctly in order.
-4. **Handle your own output ordering** if the adapter streams intermediate events. The `onEvent` callback fires for every Claude event (assistant messages, tool use, etc.) before the final result. If your protocol delivers these to the user, chain the sends to preserve order (see the Telegram adapter's `sendChain` pattern).
-5. **Handle errors from `send()`** — it can reject if the session host disconnects.
-6. **Check `response.coalesced`** — if true, this message was folded into a subsequent turn. Skip sending a response.
+2. **Build a `ChannelContext`** with channel, adapter name, and any available metadata (user name, chat title, topic). This is prepended to every message so Claude knows where it's coming from.
+3. **Call `processManager.send(channel, content, context)`** and await the result. That's it for the core interaction — ProcessManager handles spawning, queuing, session persistence, and reconnection.
+4. **Do not implement your own queuing or concurrency control.** ProcessManager owns all of that. If two messages arrive simultaneously for the same channel, both `send()` calls will resolve correctly in order.
+5. **Handle your own output ordering** if the adapter streams intermediate events. The `onEvent` callback fires for every Claude event (assistant messages, tool use, etc.) before the final result. If your protocol delivers these to the user, chain the sends to preserve order (see the Telegram adapter's `sendChain` pattern).
+6. **Handle errors from `send()`** — it can reject if the session host disconnects.
+7. **Check `response.coalesced`** — if true, this message was folded into a subsequent turn. Skip sending a response.
 
 See `src/adapters/telegram.ts` as the reference implementation and `src/adapters/http.ts` as the minimal case.
 
 ## Protocol
 
-Messages in (NDJSON on stdin):
+Messages in (NDJSON on stdin). When a `ChannelContext` is provided, ProcessManager prepends a metadata prefix to the content so Claude knows which channel, adapter, and user the message came from:
 ```json
-{"type":"user","message":{"role":"user","content":"hello"}}
+{"type":"user","message":{"role":"user","content":"[channel: tg-123, adapter: telegram, user: Alice]\nhello"}}
 ```
 
 Results out (NDJSON on stdout):
