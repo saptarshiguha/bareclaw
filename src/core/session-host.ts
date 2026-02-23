@@ -45,7 +45,36 @@ let claudeRl: Interface;
 let client: Socket | null = null;
 let lastSessionId: string | undefined = config.resumeSessionId;
 
+/**
+ * When Claude resumes a session, it replays ALL historical events through
+ * stdout before processing new input. We must suppress these replay events
+ * and buffer any client messages until replay is done.
+ *
+ * For resumed sessions: wait for events to stop flowing (2s quiet gap).
+ * For fresh sessions: ready immediately (no replay).
+ */
+let claudeReady = false;
+let readyTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingMessages: string[] = [];
+const REPLAY_QUIET_MS = 2000; // Time to wait after last replay event
+
+function onClaudeReady() {
+  claudeReady = true;
+  log(`claude ready (replay done, ${pendingMessages.length} message(s) buffered)`);
+  // Flush buffered messages
+  for (const msg of pendingMessages) {
+    if (claude.stdin && !claude.stdin.destroyed) {
+      claude.stdin.write(msg + '\n');
+    }
+  }
+  pendingMessages = [];
+}
+
 function spawnClaude() {
+  claudeReady = false;
+  pendingMessages = [];
+  if (readyTimer) clearTimeout(readyTimer);
+
   const args = [
     '-p',
     '--input-format', 'stream-json',
@@ -68,13 +97,9 @@ function spawnClaude() {
 
   claudeRl = createInterface({ input: claude.stdout!, crlfDelay: Infinity });
 
-  // Forward Claude stdout → socket client
+  // Forward Claude stdout → socket client (suppressing replay events)
   claudeRl.on('line', (line) => {
-    if (client && !client.destroyed) {
-      client.write(line + '\n');
-    }
-
-    // Capture session ID for future respawns
+    // Capture session ID regardless of replay state
     try {
       const event = JSON.parse(line);
       if (event.type === 'result' && event.session_id) {
@@ -82,7 +107,26 @@ function spawnClaude() {
         log(`captured session_id: ${lastSessionId!.substring(0, 8)}...`);
       }
     } catch {}
+
+    if (!claudeReady) {
+      // Still replaying — reset the quiet timer on each event
+      if (readyTimer) clearTimeout(readyTimer);
+      readyTimer = setTimeout(onClaudeReady, REPLAY_QUIET_MS);
+      return; // Don't forward replay events to client
+    }
+
+    // Forward live events to client
+    if (client && !client.destroyed) {
+      client.write(line + '\n');
+    }
   });
+
+  // Fresh sessions (no resume): ready immediately — no replay to wait for.
+  // Resumed sessions: wait for event-based quiet detection.
+  if (!lastSessionId) {
+    claudeReady = true;
+    log('fresh session — no replay to wait for');
+  }
 
   // Forward Claude stderr → socket client as internal event
   claude.stderr?.on('data', (chunk: Buffer) => {
@@ -104,6 +148,11 @@ function spawnClaude() {
   // Auto-respawn when Claude exits (max turns, crash, etc.)
   claude.on('exit', (code) => {
     log(`claude exited (code ${code}) — will respawn on next message`);
+    // If we were still replaying, mark as ready so buffered messages can trigger respawn
+    if (!claudeReady) {
+      if (readyTimer) clearTimeout(readyTimer);
+      claudeReady = true;
+    }
     // Notify client that the current dispatch should fail gracefully
     if (client && !client.destroyed) {
       try {
@@ -130,9 +179,14 @@ const server = createServer((socket) => {
   const socketRl = createInterface({ input: socket, crlfDelay: Infinity });
   socketRl.on('line', (line) => {
     // Handle interrupt signal — SIGINT Claude to stop current turn
+    // Ignore interrupts during replay — Claude isn't processing anything yet
     try {
       const msg = JSON.parse(line);
       if (msg.type === 'interrupt') {
+        if (!claudeReady) {
+          log('interrupt ignored (still replaying)');
+          return;
+        }
         log('interrupt requested — sending SIGINT to claude');
         claude.kill('SIGINT');
         return;
@@ -144,6 +198,13 @@ const server = createServer((socket) => {
       log('claude is dead, respawning before dispatch');
       spawnClaude();
     }
+
+    // Buffer message if Claude is still replaying history
+    if (!claudeReady) {
+      pendingMessages.push(line);
+      return;
+    }
+
     if (claude.stdin && !claude.stdin.destroyed) {
       claude.stdin.write(line + '\n');
     }

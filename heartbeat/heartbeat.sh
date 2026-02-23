@@ -22,15 +22,9 @@ fi
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
 
-# Check if server is responding
+# Check if server is responding (TCP port check — works with or without auth)
 server_alive() {
-  curl -sf -o /dev/null --max-time 5 "$BARECLAW_URL/message" -X POST \
-    -H 'Content-Type: application/json' \
-    -d '{"text":"ping","channel":"__healthcheck"}' 2>/dev/null
-  # Even a 400/500 means the server is up — curl -f only fails on HTTP errors
-  # but a connection refused means it's down. Check if port is open instead.
-  curl -sf -o /dev/null --max-time 3 "$BARECLAW_URL/" 2>/dev/null
-  return $?
+  nc -z localhost "$BARECLAW_PORT" 2>/dev/null
 }
 
 # Start the server if it's not running
