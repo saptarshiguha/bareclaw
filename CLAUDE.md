@@ -70,8 +70,14 @@ You can edit BAREclaw's own source code (in `src/`) and trigger a restart:
 - `curl -s -X POST localhost:3000/restart` or `kill -HUP $(pgrep -f 'tsx src/index.ts')`
 - Your current session will be killed as part of the restart, but it resumes on the next message.
 
+## Personality
+
+Read `SOUL.md` at the start of each session. It defines who you are — your personality, communication style, and engineering principles. Follow it.
+
+New users can run `/setup` to personalize their instance and optionally add a `## Personal` section to SOUL.md.
+
 ## Conventions
 
 - Use relative paths from project root when referencing files (e.g. `src/core/process-manager.ts`).
-- When the user requests a behavioral change or preference, persist it to this file so it carries across sessions.
+- When the user requests a behavioral change or preference, persist it to `SOUL.md` so it carries across sessions.
 - See `README.md` for full architecture documentation.

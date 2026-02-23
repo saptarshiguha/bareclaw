@@ -94,11 +94,15 @@ function formatQuestion(input: Record<string, unknown>): string {
 }
 
 /** Extract displayable content from a stream event */
-function extractContent(event: ClaudeEvent): { text?: string; toolUse?: string } {
-  if (event.type !== 'assistant' || !event.message?.content) return {};
+function extractContent(event: ClaudeEvent): { text?: string; toolUse?: string; toolResult?: string } {
+  if (!event.message?.content) return {};
+
+  // Handle assistant events (text + tool calls) and user events (tool results)
+  if (event.type !== 'assistant' && event.type !== 'user') return {};
 
   const texts: string[] = [];
   const tools: string[] = [];
+  const results: string[] = [];
 
   for (const block of event.message.content) {
     if (block.type === 'text' && block.text?.trim()) {
@@ -116,12 +120,25 @@ function extractContent(event: ClaudeEvent): { text?: string; toolUse?: string }
         const label = escapeHtml(target ? `${block.name}: ${target}` : block.name);
         tools.push(`<code>${label}</code>`);
       }
+    } else if (block.type === 'tool_result') {
+      // Tool output (e.g. bash stdout). Content can be a string or array of blocks.
+      const content = block.content as string | Array<Record<string, unknown>> | undefined;
+      if (typeof content === 'string' && content.trim()) {
+        results.push(content);
+      } else if (Array.isArray(content)) {
+        for (const sub of content) {
+          if (sub.type === 'text' && typeof sub.text === 'string' && (sub.text as string).trim()) {
+            results.push(sub.text as string);
+          }
+        }
+      }
     }
   }
 
   return {
     text: texts.length > 0 ? texts.join('\n') : undefined,
     toolUse: tools.length > 0 ? tools.join('\n') : undefined,
+    toolResult: results.length > 0 ? results.join('\n') : undefined,
   };
 }
 
@@ -167,7 +184,7 @@ export function createTelegramAdapter(config: Config, processManager: ProcessMan
 
       const channel = `tg-${ctx.chat.id}`;
       const response = await processManager.send(channel, text, (event: ClaudeEvent) => {
-        const { text: assistantText, toolUse } = extractContent(event);
+        const { text: assistantText, toolUse, toolResult } = extractContent(event);
 
         if (assistantText) {
           sentIntermediate = true;
@@ -179,6 +196,13 @@ export function createTelegramAdapter(config: Config, processManager: ProcessMan
         if (toolUse) {
           sendChain = sendChain.then(() => sendHtml(ctx, toolUse)).catch((err) => {
             console.error(`[telegram] failed to send tool notification: ${err}`);
+          });
+        }
+
+        if (toolResult) {
+          const preview = toolResult.length > 2000 ? toolResult.substring(0, 2000) + '...' : toolResult;
+          sendChain = sendChain.then(() => sendHtml(ctx, `<blockquote expandable><pre>${escapeHtml(preview)}</pre></blockquote>`)).catch((err) => {
+            console.error(`[telegram] failed to send tool result: ${err}`);
           });
         }
       });
