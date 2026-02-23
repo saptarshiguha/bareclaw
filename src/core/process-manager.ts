@@ -1,5 +1,8 @@
-import { spawn, type ChildProcess } from 'child_process';
+import { spawn } from 'child_process';
+import { connect, type Socket } from 'net';
 import { createInterface, type Interface } from 'readline';
+import { readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { resolve } from 'path';
 import type { Config } from '../config.js';
 import type { ClaudeEvent, ClaudeInput, SendMessageResponse } from './types.js';
 
@@ -12,32 +15,86 @@ interface QueuedMessage {
   onEvent?: EventCallback;
 }
 
-interface ManagedProcess {
-  proc: ChildProcess;
+/**
+ * Per-channel state. Each channel gets exactly one of these, holding:
+ * - A socket connection to the channel's session host process
+ * - A FIFO queue for messages waiting to be dispatched
+ * - A busy flag that enforces one-at-a-time dispatch
+ *
+ * The busy/queue pattern is not optional — Claude's NDJSON stdio protocol
+ * is a sequential stream. Sending a second message before the first result
+ * arrives would corrupt the stream.
+ */
+interface ManagedChannel {
+  socket: Socket;
   rl: Interface;
   busy: boolean;
   queue: QueuedMessage[];
   eventHandler: ((event: ClaudeEvent) => void) | null;
 }
 
+/**
+ * Manages Claude session processes keyed by channel.
+ *
+ * Channels are opaque strings — ProcessManager never inspects or parses them.
+ * This makes it fully adapter-agnostic: HTTP, Telegram, WebSocket, or any
+ * future adapter all get the same queuing, dispatch, and session persistence.
+ *
+ * Concurrency model:
+ * - Different channels are fully independent and concurrent.
+ * - Same channel: strict FIFO. One message dispatched at a time, with a queue
+ *   for messages that arrive while the channel is busy.
+ * - Callers just await send() — queuing is transparent.
+ */
 export class ProcessManager {
-  private channels = new Map<string, ManagedProcess>();
+  private channels = new Map<string, ManagedChannel>();
+  private connecting = new Map<string, Promise<ManagedChannel>>();
+  private sessions = new Map<string, string>();
   private config: Config;
+  private sessionFilePath: string;
 
   constructor(config: Config) {
     this.config = config;
+    this.sessionFilePath = resolve(config.cwd, config.sessionFile);
+    this.loadSessions();
   }
 
+  private socketPath(channel: string): string {
+    return `/tmp/bareclaw-${channel}.sock`;
+  }
+
+  private pidFile(channel: string): string {
+    return `/tmp/bareclaw-${channel}.pid`;
+  }
+
+  /**
+   * Send a message to a channel. If the channel doesn't exist yet, spawns a
+   * session host. If the channel is busy processing another message, queues
+   * this one and returns a promise that resolves when it's this message's turn.
+   *
+   * Callers don't need to coordinate — multiple concurrent send() calls to the
+   * same channel are safe and will be processed in arrival order.
+   */
   async send(channel: string, text: string, onEvent?: EventCallback): Promise<SendMessageResponse> {
     let managed = this.channels.get(channel);
 
-    // Spawn if needed
     if (!managed) {
-      managed = this.spawnProcess(channel);
-      this.channels.set(channel, managed);
+      // Prevent concurrent connectOrSpawn for the same channel
+      let pending = this.connecting.get(channel);
+      if (!pending) {
+        pending = this.connectOrSpawn(channel);
+        this.connecting.set(channel, pending);
+      }
+      try {
+        managed = await pending;
+        this.channels.set(channel, managed);
+      } finally {
+        this.connecting.delete(channel);
+      }
     }
 
-    // Queue if busy
+    // Channel is processing another message — queue this one.
+    // The promise resolves when drainQueue() gets to it.
     if (managed.busy) {
       return new Promise((resolve, reject) => {
         managed!.queue.push({ text, resolve, reject, onEvent });
@@ -47,96 +104,189 @@ export class ProcessManager {
     return this.dispatch(managed, text, onEvent);
   }
 
+  /** Disconnect from session hosts (they stay alive for reconnection) */
   shutdown(): void {
     for (const [channel, managed] of this.channels) {
-      managed.proc.kill();
+      managed.socket.destroy();
       managed.rl.close();
-      console.log(`[process-manager] killed process for channel: ${channel}`);
+      console.log(`[process-manager] disconnected from channel: ${channel}`);
     }
     this.channels.clear();
   }
 
-  private spawnProcess(channel: string): ManagedProcess {
-    console.log(`[process-manager] spawning claude for channel: ${channel}`);
-
-    const { ANTHROPIC_API_KEY, CLAUDE_API_KEY, ...parentEnv } = process.env;
-    const env = {
-      ...parentEnv,
-      CLAUDECODE: '',
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-    };
-
-    const proc = spawn('claude', [
-      '-p',
-      '--input-format', 'stream-json',
-      '--output-format', 'stream-json',
-      '--verbose',
-      '--max-turns', String(this.config.maxTurns),
-      '--allowedTools', this.config.allowedTools,
-    ], {
-      env,
-      cwd: this.config.cwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
-    const rl = createInterface({ input: proc.stdout!, crlfDelay: Infinity });
-
-    const managed: ManagedProcess = {
-      proc,
-      rl,
-      busy: false,
-      queue: [],
-      eventHandler: null,
-    };
-
-    // Route stdout lines to the current event handler
-    rl.on('line', (line) => {
-      if (!line.trim()) return;
+  /** Kill session hosts (for full shutdown) */
+  shutdownHosts(): void {
+    const channelsToKill = new Set([...this.channels.keys(), ...this.sessions.keys()]);
+    for (const channel of channelsToKill) {
+      const pidPath = this.pidFile(channel);
       try {
-        const event = JSON.parse(line) as ClaudeEvent;
-        console.log(`[process-manager] [${channel}] event: ${event.type}${event.subtype ? '/' + event.subtype : ''}`);
-        if (managed.eventHandler) managed.eventHandler(event);
-      } catch {
-        console.log(`[process-manager] [${channel}] non-JSON: ${line.substring(0, 100)}`);
-      }
-    });
-
-    // Collect stderr for debugging
-    proc.stderr?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString().trim();
-      if (text && !text.includes('zoxide')) {
-        console.error(`[process-manager] [${channel}] stderr: ${text.substring(0, 200)}`);
-      }
-    });
-
-    // Auto-restart: clear entry so next send() spawns fresh
-    proc.on('exit', (code) => {
-      console.log(`[process-manager] process for channel ${channel} exited (code ${code})`);
-      this.channels.delete(channel);
-      // Reject any queued messages
-      for (const queued of managed.queue) {
-        queued.reject(new Error(`Process exited unexpectedly (code ${code})`));
-      }
-      managed.queue = [];
-    });
-
-    return managed;
+        const pid = parseInt(readFileSync(pidPath, 'utf-8').trim());
+        if (Number.isFinite(pid)) {
+          process.kill(pid, 'SIGTERM');
+          console.log(`[process-manager] killed session host for channel: ${channel} (pid ${pid})`);
+        }
+      } catch {}
+    }
+    this.shutdown();
   }
 
-  private dispatch(managed: ManagedProcess, text: string, onEvent?: EventCallback): Promise<SendMessageResponse> {
+  private async connectOrSpawn(channel: string): Promise<ManagedChannel> {
+    const sockPath = this.socketPath(channel);
+
+    // Try reconnecting to an existing session host
+    try {
+      const managed = await this.tryConnect(channel, sockPath);
+      console.log(`[process-manager] reconnected to existing session host for channel: ${channel}`);
+      return managed;
+    } catch {}
+
+    // No session host running — spawn one
+    try { unlinkSync(sockPath); } catch {}
+
+    const sessionId = this.sessions.get(channel);
+    console.log(`[process-manager] spawning session host for channel: ${channel}${sessionId ? ` (resuming ${sessionId.substring(0, 8)}...)` : ''}`);
+
+    const hostConfig = JSON.stringify({
+      channel,
+      socketPath: sockPath,
+      pidFile: this.pidFile(channel),
+      cwd: this.config.cwd,
+      maxTurns: this.config.maxTurns,
+      allowedTools: this.config.allowedTools,
+      resumeSessionId: sessionId || undefined,
+    });
+
+    const sessionHostPath = resolve(import.meta.dirname, 'session-host.ts');
+    const hostProc = spawn('tsx', [sessionHostPath, hostConfig], {
+      detached: true,
+      stdio: 'ignore',
+      cwd: this.config.cwd,
+      env: process.env,
+    });
+    hostProc.unref();
+
+    // Wait for socket to come up (up to 10s)
+    for (let i = 0; i < 50; i++) {
+      await new Promise(r => setTimeout(r, 200));
+      try {
+        return await this.tryConnect(channel, sockPath);
+      } catch {}
+    }
+
+    throw new Error(`Failed to connect to session host for channel: ${channel}`);
+  }
+
+  private tryConnect(channel: string, sockPath: string): Promise<ManagedChannel> {
+    return new Promise((resolve, reject) => {
+      const socket = connect(sockPath);
+      const timeout = setTimeout(() => {
+        socket.destroy();
+        reject(new Error('Connection timeout'));
+      }, 3000);
+
+      socket.on('connect', () => {
+        clearTimeout(timeout);
+
+        const rl = createInterface({ input: socket, crlfDelay: Infinity });
+        const managed: ManagedChannel = {
+          socket,
+          rl,
+          busy: false,
+          queue: [],
+          eventHandler: null,
+        };
+
+        rl.on('line', (line) => {
+          if (!line.trim()) return;
+          try {
+            const event = JSON.parse(line) as ClaudeEvent;
+
+            // Handle internal stderr forwarding
+            if (event.type === '_stderr') {
+              const text = (event as Record<string, unknown>).text;
+              if (text) {
+                console.error(`[process-manager] [${channel}] stderr: ${String(text).substring(0, 200)}`);
+              }
+              return;
+            }
+
+            console.log(`[process-manager] [${channel}] event: ${event.type}${event.subtype ? '/' + event.subtype : ''}`);
+
+            // Capture session ID for resume
+            if (event.type === 'result' && event.session_id) {
+              this.sessions.set(channel, event.session_id);
+              this.saveSessions();
+            }
+
+            if (managed.eventHandler) managed.eventHandler(event);
+          } catch {
+            console.log(`[process-manager] [${channel}] non-JSON: ${line.substring(0, 100)}`);
+          }
+        });
+
+        socket.on('close', () => {
+          console.log(`[process-manager] session host for channel ${channel} disconnected`);
+          this.channels.delete(channel);
+          for (const queued of managed.queue) {
+            queued.reject(new Error('Session host disconnected'));
+          }
+          managed.queue = [];
+        });
+
+        socket.on('error', (err) => {
+          console.error(`[process-manager] [${channel}] socket error: ${err.message}`);
+        });
+
+        resolve(managed);
+      });
+
+      socket.on('error', (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
+    });
+  }
+
+  private loadSessions(): void {
+    try {
+      const data = readFileSync(this.sessionFilePath, 'utf-8');
+      const parsed = JSON.parse(data) as Record<string, string>;
+      for (const [channel, sessionId] of Object.entries(parsed)) {
+        this.sessions.set(channel, sessionId);
+      }
+      console.log(`[process-manager] loaded ${this.sessions.size} saved session(s)`);
+    } catch {}
+  }
+
+  private saveSessions(): void {
+    try {
+      const obj: Record<string, string> = {};
+      for (const [ch, sid] of this.sessions) obj[ch] = sid;
+      writeFileSync(this.sessionFilePath, JSON.stringify(obj, null, 2) + '\n');
+    } catch (err) {
+      console.error(`[process-manager] failed to save sessions: ${err}`);
+    }
+  }
+
+  /**
+   * Dispatch a single message to the session host socket. Sets busy=true for
+   * the duration, preventing concurrent writes to the NDJSON stream.
+   * On completion, calls drainQueue() to process the next queued message.
+   */
+  private dispatch(managed: ManagedChannel, text: string, onEvent?: EventCallback): Promise<SendMessageResponse> {
     managed.busy = true;
     const start = Date.now();
 
     return new Promise<SendMessageResponse>((resolve, reject) => {
-      // Timeout guard
-      const timer = setTimeout(() => {
-        managed.busy = false;
-        managed.eventHandler = null;
-        managed.proc.kill();
-        reject(new Error(`Timed out after ${this.config.timeoutMs}ms`));
-      }, this.config.timeoutMs);
+      const timer = this.config.timeoutMs > 0
+        ? setTimeout(() => {
+            managed.busy = false;
+            managed.eventHandler = null;
+            managed.socket.destroy();
+            reject(new Error(`Timed out after ${this.config.timeoutMs}ms`));
+          }, this.config.timeoutMs)
+        : null;
 
-      // Listen for events, forward to callback, resolve on result
       managed.eventHandler = (event) => {
         try {
           if (onEvent) onEvent(event);
@@ -145,7 +295,7 @@ export class ProcessManager {
         }
 
         if (event.type === 'result') {
-          clearTimeout(timer);
+          if (timer) clearTimeout(timer);
           managed.eventHandler = null;
           managed.busy = false;
 
@@ -159,18 +309,46 @@ export class ProcessManager {
         }
       };
 
-      // Write message to stdin
       const msg: ClaudeInput = {
         type: 'user',
         message: { role: 'user', content: text },
       };
-      managed.proc.stdin!.write(JSON.stringify(msg) + '\n');
+      managed.socket.write(JSON.stringify(msg) + '\n');
     });
   }
 
-  private drainQueue(managed: ManagedProcess): void {
+  /**
+   * Process queued messages. If multiple messages are waiting, coalesce them
+   * into a single Claude turn — their text is joined with double newlines and
+   * dispatched as one message. This handles the common case of rapid-fire
+   * messages arriving while a turn is processing.
+   *
+   * Earlier messages in the batch are resolved immediately with `coalesced: true`
+   * so their adapter handlers know to skip sending a response. Only the last
+   * message's onEvent callback receives events.
+   */
+  private drainQueue(managed: ManagedChannel): void {
     if (managed.queue.length === 0) return;
-    const next = managed.queue.shift()!;
-    this.dispatch(managed, next.text, next.onEvent).then(next.resolve, next.reject);
+
+    // Take everything waiting
+    const batch = managed.queue.splice(0);
+
+    if (batch.length === 1) {
+      // Common case — no coalescing needed
+      const msg = batch[0];
+      this.dispatch(managed, msg.text, msg.onEvent).then(msg.resolve, msg.reject);
+      return;
+    }
+
+    // Coalesce: combine text, resolve earlier messages as coalesced
+    const combinedText = batch.map(m => m.text).join('\n\n');
+    console.log(`[process-manager] coalescing ${batch.length} queued messages`);
+
+    for (let i = 0; i < batch.length - 1; i++) {
+      batch[i].resolve({ text: '', duration_ms: 0, coalesced: true });
+    }
+
+    const last = batch[batch.length - 1];
+    this.dispatch(managed, combinedText, last.onEvent).then(last.resolve, last.reject);
   }
 }

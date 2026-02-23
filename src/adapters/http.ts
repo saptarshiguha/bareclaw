@@ -2,8 +2,9 @@ import express, { type Router, type Request, type Response, type NextFunction } 
 import type { Config } from '../config.js';
 import type { ProcessManager } from '../core/process-manager.js';
 import type { SendMessageRequest } from '../core/types.js';
+import type { PushRegistry } from '../core/push-registry.js';
 
-export function createHttpAdapter(config: Config, processManager: ProcessManager, restart: () => void): Router {
+export function createHttpAdapter(config: Config, processManager: ProcessManager, restart: () => void, pushRegistry: PushRegistry): Router {
   const router = express.Router();
 
   // Bearer token auth middleware
@@ -36,6 +37,37 @@ export function createHttpAdapter(config: Config, processManager: ProcessManager
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error';
       console.error(`[http] error on channel ${ch}: ${message}`);
+      res.status(500).json({ error: message });
+    }
+  });
+
+  router.post('/send', async (req, res) => {
+    const { channel, text } = req.body as { channel?: string; text?: string };
+
+    if (!channel || typeof channel !== 'string') {
+      res.status(400).json({ error: 'Missing "channel" field' });
+      return;
+    }
+    if (!text || typeof text !== 'string') {
+      res.status(400).json({ error: 'Missing "text" field' });
+      return;
+    }
+
+    console.log(`[http] /send -> ${channel}: ${text.substring(0, 80)}${text.length > 80 ? '...' : ''}`);
+
+    try {
+      const sent = await pushRegistry.send(channel, text);
+      if (sent) {
+        res.json({ status: 'sent', channel });
+      } else {
+        res.status(404).json({
+          error: `No push handler for channel: ${channel}`,
+          registered_prefixes: pushRegistry.prefixes,
+        });
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      console.error(`[http] /send error: ${message}`);
       res.status(500).json({ error: message });
     }
   });

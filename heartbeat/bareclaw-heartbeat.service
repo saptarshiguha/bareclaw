@@ -1,0 +1,7 @@
+[Unit]
+Description=BAREclaw heartbeat — checks for pending work
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=__HEARTBEAT_SCRIPT__

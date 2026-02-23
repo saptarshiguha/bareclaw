@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template plist. install.sh replaces __HEARTBEAT_SCRIPT__ with the
+  absolute path to heartbeat.sh before copying to ~/Library/LaunchAgents/.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.bareclaw.heartbeat</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>__HEARTBEAT_SCRIPT__</string>
+	</array>
+
+	<key>StartInterval</key>
+	<integer>3600</integer>
+
+	<key>StandardOutPath</key>
+	<string>/tmp/bareclaw-heartbeat-launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/bareclaw-heartbeat-launchd.log</string>
+
+	<key>RunAtLoad</key>
+	<false/>
+</dict>
+</plist>

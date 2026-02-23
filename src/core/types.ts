@@ -31,7 +31,19 @@ export interface SendMessageRequest {
   channel?: string;
 }
 
+/**
+ * Pushes a message to a user through an adapter's native protocol,
+ * bypassing ProcessManager entirely. Registered by adapters at startup.
+ */
+export type PushHandler = (channel: string, text: string) => Promise<boolean>;
+
 export interface SendMessageResponse {
   text: string;
   duration_ms: number;
+  /**
+   * True if this message was coalesced into a subsequent queued message.
+   * When set, the caller should skip sending a response — the combined
+   * message's caller will handle it.
+   */
+  coalesced?: boolean;
 }

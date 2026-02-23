@@ -5,10 +5,19 @@ export interface Config {
   cwd: string;
   maxTurns: number;
   allowedTools: string;
+  /**
+   * Per-message timeout in milliseconds. Must be 0 (disabled) in production.
+   *
+   * BAREclaw sessions are persistent and agentic — a single response may
+   * involve multi-step tool use that takes minutes. A non-zero timeout would
+   * kill the socket mid-response, corrupt the channel's queue state, and
+   * force a session host respawn. Only set this non-zero for debugging hangs.
+   */
   timeoutMs: number;
   httpToken: string | undefined;
   telegramToken: string | undefined;
   allowedUsers: number[];
+  sessionFile: string;
 }
 
 export function loadConfig(): Config {
@@ -18,11 +27,12 @@ export function loadConfig(): Config {
     cwd: (process.env.BARECLAW_CWD || homedir()).replace(/^~/, homedir()),
     maxTurns: parseInt(process.env.BARECLAW_MAX_TURNS || '25', 10),
     allowedTools: process.env.BARECLAW_ALLOWED_TOOLS || 'Read,Glob,Grep,Bash,Write,Edit,Skill,Task',
-    timeoutMs: parseInt(process.env.BARECLAW_TIMEOUT_MS || '120000', 10),
+    timeoutMs: parseInt(process.env.BARECLAW_TIMEOUT_MS || '0', 10),
     httpToken: process.env.BARECLAW_HTTP_TOKEN || undefined,
     telegramToken: process.env.BARECLAW_TELEGRAM_TOKEN || undefined,
     allowedUsers: allowedUsersRaw
       ? allowedUsersRaw.split(',').map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite)
       : [],
+    sessionFile: process.env.BARECLAW_SESSION_FILE || '.bareclaw-sessions.json',
   };
 }
