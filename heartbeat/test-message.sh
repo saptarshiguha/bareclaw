@@ -7,14 +7,19 @@ set -euo pipefail
 BARECLAW_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="/tmp/bareclaw-test-message.log"
 PORT="${BARECLAW_PORT:-3000}"
-CHANNEL="tg-8305437552"
 COUNTER_FILE="/tmp/bareclaw-test-counter"
 
-# Load token from .env if available
+# Load config from .env if available
 TOKEN=""
+CHANNEL=""
 if [ -f "$BARECLAW_DIR/.env" ]; then
   TOKEN=$(grep -E '^BARECLAW_HTTP_TOKEN=' "$BARECLAW_DIR/.env" | cut -d= -f2-)
+  ALLOWED=$(grep -E '^BARECLAW_ALLOWED_USERS=' "$BARECLAW_DIR/.env" | cut -d= -f2-)
+  if [ -n "$ALLOWED" ]; then
+    CHANNEL="tg-${ALLOWED%%,*}"
+  fi
 fi
+CHANNEL="${CHANNEL:-${1:?Usage: test-message.sh [channel]}}"
 
 # Increment counter
 COUNT=0
