@@ -51,4 +51,6 @@ export interface SendMessageResponse {
    * message's caller will handle it.
    */
   coalesced?: boolean;
+  /** True if the session ended with an error (exit, crash, etc.) */
+  is_error?: boolean;
 }

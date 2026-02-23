@@ -202,8 +202,15 @@ class StatusLine {
     await this.pending;
   }
 
+  /** Reset the status line so the next tool creates a fresh message */
+  reset() {
+    this.pending = this.pending.then(() => {});
+    this.messageId = null;
+    this.tools = [];
+  }
+
   private async update() {
-    const text = this.tools.map(t => `<code>${escapeHtml(t)}</code>`).join('  ');
+    const text = this.tools.map(t => `<code>${escapeHtml(t)}</code>`).join('\n');
     if (text.length === 0) return;
 
     try {
@@ -281,6 +288,7 @@ export function createTelegramAdapter(config: Config, processManager: ProcessMan
               sendChain = sendChain
                 .then(() => status.flush())
                 .then(() => sendHtml(ctx, markdownToHtml(block.text!)))
+                .then(() => status.reset())
                 .catch((err) => console.error(`[telegram] send error: ${err}`));
             }
           } else if (block.type === 'tool_use' && block.name && !HIDDEN_TOOLS.has(block.name)) {
@@ -291,18 +299,21 @@ export function createTelegramAdapter(config: Config, processManager: ProcessMan
               sendChain = sendChain
                 .then(() => status.flush())
                 .then(() => sendHtml(ctx, formatDiff(input!)))
+                .then(() => status.reset())
                 .catch((err) => console.error(`[telegram] send error: ${err}`));
             } else if (block.name === 'Write' && input) {
               // Rich message: collapsible file preview
               sendChain = sendChain
                 .then(() => status.flush())
                 .then(() => sendHtml(ctx, formatWrite(input!)))
+                .then(() => status.reset())
                 .catch((err) => console.error(`[telegram] send error: ${err}`));
             } else if (block.name === 'AskUserQuestion' && input) {
               // Rich message: question with options
               sendChain = sendChain
                 .then(() => status.flush())
                 .then(() => sendHtml(ctx, formatQuestion(input!)))
+                .then(() => status.reset())
                 .catch((err) => console.error(`[telegram] send error: ${err}`));
             } else {
               // Status line: compact tool indicator
@@ -322,7 +333,8 @@ export function createTelegramAdapter(config: Config, processManager: ProcessMan
       console.log(`[telegram] -> user ${userId}: ${response.duration_ms}ms`);
 
       // Send the final result only if we didn't already stream it
-      if (!sentStreamed && !compacting && response.text.trim()) {
+      // Skip error results (session ended, crash) — not useful to the user
+      if (!sentStreamed && !compacting && !response.is_error && response.text.trim()) {
         await sendHtml(ctx, markdownToHtml(response.text));
       }
     } catch (err) {

@@ -96,10 +96,10 @@ export class ProcessManager {
       }
     }
 
-    // Channel is busy — interrupt the current turn so this message gets through faster
+    // Channel is busy — queue the message. When the current turn completes,
+    // drainQueue() will coalesce all waiting messages into a single turn.
     if (managed.busy) {
-      managed.socket.write(JSON.stringify({ type: 'interrupt' }) + '\n');
-      console.log(`[process-manager] [${channel}] interrupted current turn for new message`);
+      console.log(`[process-manager] [${channel}] queued (${managed.queue.length + 1} waiting)`);
       return new Promise((resolve, reject) => {
         managed!.queue.push({ content, resolve, reject, onEvent });
       });
@@ -306,6 +306,7 @@ export class ProcessManager {
           const response: SendMessageResponse = {
             text: event.result || '',
             duration_ms: Date.now() - start,
+            is_error: event.is_error || false,
           };
 
           resolve(response);
