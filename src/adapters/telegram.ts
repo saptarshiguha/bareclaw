@@ -14,7 +14,7 @@ import { Telegraf } from 'telegraf';
 import type { Context } from 'telegraf';
 import type { Config } from '../config.js';
 import type { ProcessManager, MessageContent } from '../core/process-manager.js';
-import type { ClaudeEvent, ContentBlock, PushHandler } from '../core/types.js';
+import type { ChannelContext, ClaudeEvent, ContentBlock, PushHandler } from '../core/types.js';
 
 const MAX_MESSAGE_LENGTH = 4096;
 const FILLER_MAX_LENGTH = 100;
@@ -265,7 +265,17 @@ export function createTelegramAdapter(config: Config, processManager: ProcessMan
       const status = new StatusLine(ctx);
 
       const channel = `tg-${ctx.chat!.id}`;
-      const response = await processManager.send(channel, content, (event: ClaudeEvent) => {
+      const msg = ctx.message as Record<string, unknown> | undefined;
+      const replyTo = msg?.reply_to_message as Record<string, unknown> | undefined;
+      const forumTopic = replyTo?.forum_topic_created as { name?: string } | undefined;
+      const context: ChannelContext = {
+        channel,
+        adapter: 'telegram',
+        userName: ctx.from ? [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ') : undefined,
+        chatTitle: ctx.chat!.type !== 'private' ? (ctx.chat as { title?: string }).title : undefined,
+        topicName: forumTopic?.name || undefined,
+      };
+      const response = await processManager.send(channel, content, context, (event: ClaudeEvent) => {
         if (event.type === 'system' && event.subtype === 'compact_boundary') {
           compacting = true;
           return;

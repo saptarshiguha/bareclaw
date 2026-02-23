@@ -19,6 +19,7 @@ interface HostConfig {
   maxTurns: number;
   allowedTools: string;
   resumeSessionId?: string;
+  channelContext?: { channel: string; adapter: string };
 }
 
 const config: HostConfig = JSON.parse(process.argv[2]!);
@@ -78,6 +79,11 @@ function spawnClaude() {
   ];
   if (lastSessionId) {
     args.push('--resume', lastSessionId);
+  }
+  if (config.channelContext) {
+    args.push('--append-system-prompt',
+      `You are operating on BAREclaw channel "${config.channelContext.channel}" (adapter: ${config.channelContext.adapter}).`
+    );
   }
 
   log(`spawning claude${lastSessionId ? ` (resuming ${lastSessionId.substring(0, 8)}...)` : ''}`);

@@ -4,7 +4,7 @@ import { createInterface, type Interface } from 'readline';
 import { readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { resolve } from 'path';
 import type { Config } from '../config.js';
-import type { ClaudeEvent, ClaudeInput, ContentBlock, SendMessageResponse } from './types.js';
+import type { ChannelContext, ClaudeEvent, ClaudeInput, ContentBlock, SendMessageResponse } from './types.js';
 
 export type EventCallback = (event: ClaudeEvent) => void;
 
@@ -13,6 +13,7 @@ export type MessageContent = string | ContentBlock[];
 
 interface QueuedMessage {
   content: MessageContent;
+  context?: ChannelContext;
   resolve: (r: SendMessageResponse) => void;
   reject: (e: Error) => void;
   onEvent?: EventCallback;
@@ -29,6 +30,7 @@ interface QueuedMessage {
  * arrives would corrupt the stream.
  */
 interface ManagedChannel {
+  channel: string;
   socket: Socket;
   rl: Interface;
   busy: boolean;
@@ -78,7 +80,7 @@ export class ProcessManager {
    * Callers don't need to coordinate — multiple concurrent send() calls to the
    * same channel are safe and will be processed in arrival order.
    */
-  async send(channel: string, content: MessageContent, onEvent?: EventCallback): Promise<SendMessageResponse> {
+  async send(channel: string, content: MessageContent, context?: ChannelContext, onEvent?: EventCallback): Promise<SendMessageResponse> {
     let managed = this.channels.get(channel);
 
     if (!managed) {
@@ -101,11 +103,11 @@ export class ProcessManager {
     if (managed.busy) {
       console.log(`[process-manager] [${channel}] queued (${managed.queue.length + 1} waiting)`);
       return new Promise((resolve, reject) => {
-        managed!.queue.push({ content, resolve, reject, onEvent });
+        managed!.queue.push({ content, context, resolve, reject, onEvent });
       });
     }
 
-    return this.dispatch(managed, content, onEvent);
+    return this.dispatch(managed, content, context, onEvent);
   }
 
   /** Disconnect from session hosts (they stay alive for reconnection) */
@@ -150,6 +152,10 @@ export class ProcessManager {
     const sessionId = this.sessions.get(channel);
     console.log(`[process-manager] spawning session host for channel: ${channel}${sessionId ? ` (resuming ${sessionId.substring(0, 8)}...)` : ''}`);
 
+    const dash = channel.indexOf('-');
+    const adapterPrefix = dash > 0 ? channel.substring(0, dash) : channel;
+    const adapterNames: Record<string, string> = { tg: 'telegram', http: 'http' };
+
     const hostConfig = JSON.stringify({
       channel,
       socketPath: sockPath,
@@ -158,6 +164,7 @@ export class ProcessManager {
       maxTurns: this.config.maxTurns,
       allowedTools: this.config.allowedTools,
       resumeSessionId: sessionId || undefined,
+      channelContext: { channel, adapter: adapterNames[adapterPrefix] || adapterPrefix },
     });
 
     const sessionHostPath = resolve(import.meta.dirname, 'session-host.ts');
@@ -193,6 +200,7 @@ export class ProcessManager {
 
         const rl = createInterface({ input: socket, crlfDelay: Infinity });
         const managed: ManagedChannel = {
+          channel,
           socket,
           rl,
           busy: false,
@@ -277,9 +285,23 @@ export class ProcessManager {
    * the duration, preventing concurrent writes to the NDJSON stream.
    * On completion, calls drainQueue() to process the next queued message.
    */
-  private dispatch(managed: ManagedChannel, content: MessageContent, onEvent?: EventCallback): Promise<SendMessageResponse> {
+  private prependContext(content: MessageContent, ctx: ChannelContext): MessageContent {
+    const parts = [`channel: ${ctx.channel}`, `adapter: ${ctx.adapter}`];
+    if (ctx.userName) parts.push(`user: ${ctx.userName}`);
+    if (ctx.chatTitle) parts.push(`chat: ${ctx.chatTitle}`);
+    if (ctx.topicName) parts.push(`topic: ${ctx.topicName}`);
+    const prefix = `[${parts.join(', ')}]`;
+
+    if (typeof content === 'string') {
+      return `${prefix}\n${content}`;
+    }
+    return [{ type: 'text' as const, text: prefix }, ...content];
+  }
+
+  private dispatch(managed: ManagedChannel, content: MessageContent, context?: ChannelContext, onEvent?: EventCallback): Promise<SendMessageResponse> {
     managed.busy = true;
     const start = Date.now();
+    const enrichedContent = context ? this.prependContext(content, context) : content;
 
     return new Promise<SendMessageResponse>((resolve, reject) => {
       const timer = this.config.timeoutMs > 0
@@ -316,7 +338,7 @@ export class ProcessManager {
 
       const msg: ClaudeInput = {
         type: 'user',
-        message: { role: 'user', content },
+        message: { role: 'user', content: enrichedContent },
       };
       managed.socket.write(JSON.stringify(msg) + '\n');
     });
@@ -341,7 +363,7 @@ export class ProcessManager {
     if (batch.length === 1) {
       // Common case — no coalescing needed
       const msg = batch[0];
-      this.dispatch(managed, msg.content, msg.onEvent).then(msg.resolve, msg.reject);
+      this.dispatch(managed, msg.content, msg.context, msg.onEvent).then(msg.resolve, msg.reject);
       return;
     }
 
@@ -358,12 +380,12 @@ export class ProcessManager {
       }
 
       const last = batch[batch.length - 1];
-      this.dispatch(managed, combinedText, last.onEvent).then(last.resolve, last.reject);
+      this.dispatch(managed, combinedText, last.context, last.onEvent).then(last.resolve, last.reject);
     } else {
       // Dispatch first, re-queue the rest
       const first = batch[0];
       managed.queue.unshift(...batch.slice(1));
-      this.dispatch(managed, first.content, first.onEvent).then(first.resolve, first.reject);
+      this.dispatch(managed, first.content, first.context, first.onEvent).then(first.resolve, first.reject);
     }
   }
 }

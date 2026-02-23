@@ -76,7 +76,7 @@ describe('HTTP adapter', () => {
       const res = await request(app, '/message', { text: 'hello', channel: 'test' });
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ text: 'response', duration_ms: 100 });
-      expect(pm.send).toHaveBeenCalledWith('test', 'hello');
+      expect(pm.send).toHaveBeenCalledWith('test', 'hello', { channel: 'test', adapter: 'http' });
     });
 
     it('defaults channel to "http"', async () => {
@@ -84,7 +84,7 @@ describe('HTTP adapter', () => {
       const app = buildApp(makeConfig(), pm, mockPushRegistry());
 
       await request(app, '/message', { text: 'hello' });
-      expect(pm.send).toHaveBeenCalledWith('http', 'hello');
+      expect(pm.send).toHaveBeenCalledWith('http', 'hello', { channel: 'http', adapter: 'http' });
     });
 
     it('returns 400 for missing text', async () => {
@@ -110,7 +110,7 @@ describe('HTTP adapter', () => {
 
       const res = await request(app, '/message', { content, channel: 'test' });
       expect(res.status).toBe(200);
-      expect(pm.send).toHaveBeenCalledWith('test', content);
+      expect(pm.send).toHaveBeenCalledWith('test', content, { channel: 'test', adapter: 'http' });
     });
 
     it('returns 500 when processManager throws', async () => {

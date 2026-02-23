@@ -1,7 +1,7 @@
 import express, { type Router, type Request, type Response, type NextFunction } from 'express';
 import type { Config } from '../config.js';
 import type { ProcessManager } from '../core/process-manager.js';
-import type { SendMessageRequest } from '../core/types.js';
+import type { ChannelContext, SendMessageRequest } from '../core/types.js';
 import type { PushRegistry } from '../core/push-registry.js';
 
 export function createHttpAdapter(config: Config, processManager: ProcessManager, restart: () => void, pushRegistry: PushRegistry): Router {
@@ -31,13 +31,14 @@ export function createHttpAdapter(config: Config, processManager: ProcessManager
     }
 
     const ch = channel || 'http';
+    const context: ChannelContext = { channel: ch, adapter: 'http' };
     const label = typeof messageContent === 'string'
       ? messageContent.substring(0, 80) + (messageContent.length > 80 ? '...' : '')
       : `[${(messageContent as unknown[]).length} content blocks]`;
     console.log(`[http] ← ${ch}: ${label}`);
 
     try {
-      const response = await processManager.send(ch, messageContent);
+      const response = await processManager.send(ch, messageContent, context);
       console.log(`[http] → ${ch}: ${response.duration_ms}ms`);
       res.json(response);
     } catch (err) {

@@ -31,6 +31,15 @@ export interface ClaudeEvent {
   [key: string]: unknown;
 }
 
+/** Metadata about the channel a message originates from */
+export interface ChannelContext {
+  channel: string;
+  adapter: string;
+  userName?: string;
+  chatTitle?: string;
+  topicName?: string;
+}
+
 export interface SendMessageRequest {
   text: string;
   channel?: string;
