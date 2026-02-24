@@ -56,3 +56,7 @@ BAREclaw is infrastructure, not product. It's the thinnest possible layer betwee
 - Not a UI. The Telegram adapter sends text. The HTTP adapter returns JSON. That's it.
 - Not a session manager. Claude handles its own context. BAREclaw just keeps the process alive and routes messages to it.
 - Not multi-tenant. All channels share the same tool permissions, the same working directory, the same Claude binary.
+
+## Personal
+
+- **Timezone:** EST (US Eastern)
