@@ -1,4 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFile, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import {
   escapeHtml,
   markdownToHtml,
@@ -8,6 +11,9 @@ import {
   formatWrite,
   formatQuestion,
   HIDDEN_TOOLS,
+  mimeFromExt,
+  extFromUrl,
+  downloadTelegramFile,
 } from './telegram.js';
 
 describe('escapeHtml', () => {
@@ -254,5 +260,197 @@ describe('HIDDEN_TOOLS', () => {
     expect(HIDDEN_TOOLS.has('Write')).toBe(false);
     expect(HIDDEN_TOOLS.has('Grep')).toBe(false);
     expect(HIDDEN_TOOLS.has('Glob')).toBe(false);
+  });
+});
+
+// --- Media file handling ---
+
+describe('mimeFromExt', () => {
+  it('maps common image extensions', () => {
+    expect(mimeFromExt('.jpg')).toBe('image/jpeg');
+    expect(mimeFromExt('.jpeg')).toBe('image/jpeg');
+    expect(mimeFromExt('.png')).toBe('image/png');
+    expect(mimeFromExt('.gif')).toBe('image/gif');
+    expect(mimeFromExt('.webp')).toBe('image/webp');
+    expect(mimeFromExt('.bmp')).toBe('image/bmp');
+  });
+
+  it('maps video extensions', () => {
+    expect(mimeFromExt('.mp4')).toBe('video/mp4');
+    expect(mimeFromExt('.mov')).toBe('video/quicktime');
+    expect(mimeFromExt('.webm')).toBe('video/webm');
+  });
+
+  it('maps audio extensions', () => {
+    expect(mimeFromExt('.mp3')).toBe('audio/mpeg');
+    expect(mimeFromExt('.ogg')).toBe('audio/ogg');
+    expect(mimeFromExt('.wav')).toBe('audio/wav');
+    expect(mimeFromExt('.flac')).toBe('audio/flac');
+    expect(mimeFromExt('.m4a')).toBe('audio/mp4');
+  });
+
+  it('maps document extensions', () => {
+    expect(mimeFromExt('.pdf')).toBe('application/pdf');
+    expect(mimeFromExt('.zip')).toBe('application/zip');
+    expect(mimeFromExt('.tgs')).toBe('application/x-tgsticker');
+  });
+
+  it('is case-insensitive', () => {
+    expect(mimeFromExt('.JPG')).toBe('image/jpeg');
+    expect(mimeFromExt('.PNG')).toBe('image/png');
+    expect(mimeFromExt('.MP4')).toBe('video/mp4');
+  });
+
+  it('returns octet-stream for unknown extensions', () => {
+    expect(mimeFromExt('.xyz')).toBe('application/octet-stream');
+    expect(mimeFromExt('.foo')).toBe('application/octet-stream');
+    expect(mimeFromExt('')).toBe('application/octet-stream');
+  });
+});
+
+describe('extFromUrl', () => {
+  it('extracts extension from simple URLs', () => {
+    expect(extFromUrl('https://example.com/file.jpg')).toBe('.jpg');
+    expect(extFromUrl('https://example.com/path/to/doc.pdf')).toBe('.pdf');
+  });
+
+  it('extracts extension from URLs with query strings', () => {
+    expect(extFromUrl('https://cdn.telegram.org/file/photo.jpg?token=abc')).toBe('.jpg');
+  });
+
+  it('extracts extension from filenames', () => {
+    expect(extFromUrl('report.pdf')).toBe('.pdf');
+    expect(extFromUrl('song.mp3')).toBe('.mp3');
+  });
+
+  it('returns empty string when no extension found', () => {
+    expect(extFromUrl('https://example.com/noext')).toBe('');
+    expect(extFromUrl('')).toBe('');
+  });
+
+  it('handles multiple dots in path', () => {
+    expect(extFromUrl('https://example.com/file.backup.tar.gz')).toBe('.gz');
+  });
+});
+
+describe('downloadTelegramFile', () => {
+  const MEDIA_DIR = join(homedir(), '.bareclaw', 'media');
+  const TEST_CHANNEL = 'tg-test-download';
+  const testDir = join(MEDIA_DIR, TEST_CHANNEL);
+
+  afterEach(async () => {
+    await rm(testDir, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  function mockCtx(url: string) {
+    return {
+      telegram: {
+        getFileLink: vi.fn().mockResolvedValue(new URL(url)),
+      },
+    } as any;
+  }
+
+  function mockFetch(body: Buffer | string, headers: Record<string, string> = {}) {
+    const buf = typeof body === 'string' ? Buffer.from(body) : body;
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      headers: new Headers(headers),
+      arrayBuffer: () => Promise.resolve(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)),
+    } as any);
+  }
+
+  it('downloads a file and saves to disk', async () => {
+    const ctx = mockCtx('https://cdn.telegram.org/file/photo.jpg');
+    const payload = Buffer.from('fake image data');
+    mockFetch(payload);
+
+    const result = await downloadTelegramFile(ctx, 'file-123', TEST_CHANNEL, { ext: '.jpg' });
+
+    expect(result.buffer).toEqual(payload);
+    expect(result.ext).toBe('.jpg');
+    expect(result.mime).toBe('image/jpeg');
+    expect(result.path).toMatch(new RegExp(`${TEST_CHANNEL}/\\d+-file\\.jpg$`));
+
+    // Verify file actually written to disk
+    const ondisk = await readFile(result.path);
+    expect(ondisk).toEqual(payload);
+  });
+
+  it('uses original filename when provided', async () => {
+    const ctx = mockCtx('https://cdn.telegram.org/file/abc123');
+    mockFetch('hello');
+
+    const result = await downloadTelegramFile(ctx, 'f1', TEST_CHANNEL, {
+      fileName: 'report.pdf',
+      ext: '.pdf',
+    });
+
+    expect(result.path).toContain('report.pdf');
+    expect(result.mime).toBe('application/pdf');
+  });
+
+  it('sanitizes unsafe characters in filenames', async () => {
+    const ctx = mockCtx('https://cdn.telegram.org/file/x');
+    mockFetch('data');
+
+    const result = await downloadTelegramFile(ctx, 'f1', TEST_CHANNEL, {
+      fileName: '../etc/passwd',
+      ext: '.txt',
+    });
+
+    // Slashes are replaced with _, preventing path traversal
+    const filename = result.path.split('/').pop()!;
+    expect(filename).not.toContain('/');
+    expect(filename).toContain('.._etc_passwd');
+    // File still lands in the expected directory
+    expect(result.path).toMatch(new RegExp(`${TEST_CHANNEL}/`));
+  });
+
+  it('falls back to extension from URL when no ext option given', async () => {
+    const ctx = mockCtx('https://cdn.telegram.org/file/thing.png');
+    mockFetch('px');
+
+    const result = await downloadTelegramFile(ctx, 'f1', TEST_CHANNEL);
+
+    expect(result.ext).toBe('.png');
+    expect(result.mime).toBe('image/png');
+  });
+
+  it('falls back to .bin when no extension anywhere', async () => {
+    const ctx = mockCtx('https://cdn.telegram.org/file/noext');
+    mockFetch('bytes');
+
+    const result = await downloadTelegramFile(ctx, 'f1', TEST_CHANNEL);
+
+    expect(result.ext).toBe('.bin');
+    expect(result.mime).toBe('application/octet-stream');
+  });
+
+  it('throws on HTTP error', async () => {
+    const ctx = mockCtx('https://cdn.telegram.org/file/x');
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: false, status: 404 } as any);
+
+    await expect(downloadTelegramFile(ctx, 'f1', TEST_CHANNEL))
+      .rejects.toThrow('Failed to download file: 404');
+  });
+
+  it('rejects files over 20MB by content-length', async () => {
+    const ctx = mockCtx('https://cdn.telegram.org/file/big.zip');
+    const headers = { 'content-length': String(25 * 1024 * 1024) };
+    mockFetch('small', headers);
+
+    await expect(downloadTelegramFile(ctx, 'f1', TEST_CHANNEL, { ext: '.zip' }))
+      .rejects.toThrow(/too large/i);
+  });
+
+  it('rejects files over 20MB by actual buffer size', async () => {
+    const ctx = mockCtx('https://cdn.telegram.org/file/big.bin');
+    const huge = Buffer.alloc(21 * 1024 * 1024);
+    // No content-length header — size check happens after download
+    mockFetch(huge);
+
+    await expect(downloadTelegramFile(ctx, 'f1', TEST_CHANNEL, { ext: '.bin' }))
+      .rejects.toThrow(/too large/i);
   });
 });

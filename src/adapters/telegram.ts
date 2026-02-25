@@ -12,6 +12,9 @@
  */
 import { Telegraf } from 'telegraf';
 import type { Context } from 'telegraf';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import type { Config } from '../config.js';
 import type { ProcessManager, MessageContent } from '../core/process-manager.js';
 import type { ChannelContext, ClaudeEvent, ContentBlock, PushHandler } from '../core/types.js';
@@ -227,6 +230,77 @@ class StatusLine {
   }
 }
 
+const MEDIA_DIR = join(homedir(), '.bareclaw', 'media');
+const MAX_FILE_SIZE = 20 * 1024 * 1024; // Telegram bot API limit is 20MB
+
+/** Map file extensions to MIME types for common Telegram media */
+export function mimeFromExt(ext: string): string {
+  const map: Record<string, string> = {
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+    '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp',
+    '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.avi': 'video/x-msvideo',
+    '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg', '.oga': 'audio/ogg',
+    '.wav': 'audio/wav', '.flac': 'audio/flac', '.m4a': 'audio/mp4',
+    '.pdf': 'application/pdf', '.zip': 'application/zip',
+    '.tgs': 'application/x-tgsticker', '.webm': 'video/webm',
+  };
+  return map[ext.toLowerCase()] || 'application/octet-stream';
+}
+
+/** Get file extension from a URL or filename */
+export function extFromUrl(url: string): string {
+  const match = url.match(/\.(\w+)(?:\?|$)/);
+  return match ? `.${match[1]}` : '';
+}
+
+interface DownloadedFile {
+  path: string;
+  buffer: Buffer;
+  ext: string;
+  mime: string;
+}
+
+/**
+ * Download a Telegram file to ~/.bareclaw/media/<channel>/.
+ * Returns the local path, buffer, extension, and MIME type.
+ */
+export async function downloadTelegramFile(
+  ctx: Context,
+  fileId: string,
+  channel: string,
+  opts?: { fileName?: string; ext?: string }
+): Promise<DownloadedFile> {
+  const fileLink = await ctx.telegram.getFileLink(fileId);
+  const url = fileLink.toString();
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Failed to download file: ${resp.status}`);
+
+  const contentLength = parseInt(resp.headers.get('content-length') || '0', 10);
+  if (contentLength > MAX_FILE_SIZE) {
+    throw new Error(`File too large (${(contentLength / 1024 / 1024).toFixed(1)}MB, max ${MAX_FILE_SIZE / 1024 / 1024}MB)`);
+  }
+
+  const buffer = Buffer.from(await resp.arrayBuffer());
+  if (buffer.length > MAX_FILE_SIZE) {
+    throw new Error(`File too large (${(buffer.length / 1024 / 1024).toFixed(1)}MB, max ${MAX_FILE_SIZE / 1024 / 1024}MB)`);
+  }
+
+  const ext = opts?.ext || extFromUrl(url) || '.bin';
+  const mime = mimeFromExt(ext);
+  const timestamp = Date.now();
+  const safeName = opts?.fileName
+    ? opts.fileName.replace(/[^a-zA-Z0-9._-]/g, '_')
+    : `file${ext}`;
+  const fileName = `${timestamp}-${safeName}`;
+
+  const dir = join(MEDIA_DIR, channel);
+  await mkdir(dir, { recursive: true });
+  const filePath = join(dir, fileName);
+  await writeFile(filePath, buffer);
+
+  return { path: filePath, buffer, ext, mime };
+}
+
 export function createTelegramAdapter(config: Config, processManager: ProcessManager): { bot: Telegraf; pushHandler: PushHandler } {
   if (config.allowedUsers.length === 0) {
     throw new Error(
@@ -360,35 +434,190 @@ export function createTelegramAdapter(config: Config, processManager: ProcessMan
     await handleMessage(ctx, text, label);
   });
 
-  bot.on('photo', async (ctx) => {
-    try {
-      const photo = ctx.message.photo[ctx.message.photo.length - 1];
-      const fileLink = await ctx.telegram.getFileLink(photo.file_id);
-      const resp = await fetch(fileLink.toString());
-      if (!resp.ok) throw new Error(`Failed to download photo: ${resp.status}`);
-      const contentLength = parseInt(resp.headers.get('content-length') || '0', 10);
-      if (contentLength > 10 * 1024 * 1024) {
-        throw new Error('Photo too large (max 10MB)');
+  /** Derive the channel key for a context (used by media handlers for file storage) */
+  function channelFor(ctx: Context): string {
+    const msg = ctx.message as Record<string, unknown> | undefined;
+    const threadId = msg?.message_thread_id as number | undefined;
+    return threadId ? `tg-${ctx.chat!.id}-${threadId}` : `tg-${ctx.chat!.id}`;
+  }
+
+  /** Wrap a media handler with auth check + error handling */
+  function mediaHandler<T extends Context>(type: string, handler: (ctx: T) => Promise<void>) {
+    return async (ctx: T) => {
+      if (!config.allowedUsers.includes(ctx.from!.id)) {
+        console.log(`[telegram] blocked ${type} from user ${ctx.from!.id}`);
+        return;
       }
-      const buffer = Buffer.from(await resp.arrayBuffer());
-      const base64Data = buffer.toString('base64');
-      const url = fileLink.toString();
-      const mediaType = url.endsWith('.png') ? 'image/png'
-        : url.endsWith('.gif') ? 'image/gif'
-        : url.endsWith('.webp') ? 'image/webp'
-        : 'image/jpeg';
-      const caption = ctx.message.caption || 'What do you see in this image?';
+      try {
+        await handler(ctx);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unknown error';
+        console.error(`[telegram] ${type} error: ${message}`);
+        await ctx.reply(`Error processing ${type}: ${message}`).catch(() => {});
+      }
+    };
+  }
+
+  // --- Photos: base64 for Claude vision + saved to disk ---
+  bot.on('photo', mediaHandler('photo', async (ctx) => {
+    const channel = channelFor(ctx);
+    const photo = ctx.message.photo[ctx.message.photo.length - 1];
+    const file = await downloadTelegramFile(ctx, photo.file_id, channel, { ext: '.jpg' });
+
+    const base64Data = file.buffer.toString('base64');
+    const mediaType = file.ext === '.png' ? 'image/png'
+      : file.ext === '.gif' ? 'image/gif'
+      : file.ext === '.webp' ? 'image/webp'
+      : 'image/jpeg';
+
+    const caption = ctx.message.caption || 'What do you see in this image?';
+    const content: ContentBlock[] = [
+      { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64Data } },
+      { type: 'text', text: `${caption}\n\n(saved to ${file.path})` },
+    ];
+    await handleMessage(ctx, content, `[photo] ${caption.substring(0, 60)}`);
+  }));
+
+  // --- Documents: any file type ---
+  bot.on('document', mediaHandler('document', async (ctx) => {
+    const channel = channelFor(ctx);
+    const doc = ctx.message.document;
+    const ext = doc.file_name ? extFromUrl(doc.file_name) || '.bin' : '.bin';
+    const file = await downloadTelegramFile(ctx, doc.file_id, channel, {
+      fileName: doc.file_name || undefined,
+      ext,
+    });
+
+    const caption = ctx.message.caption || '';
+    const isImage = file.mime.startsWith('image/');
+
+    if (isImage) {
+      // Render images inline for Claude vision
+      const base64Data = file.buffer.toString('base64');
       const content: ContentBlock[] = [
-        { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64Data } },
-        { type: 'text', text: caption },
+        { type: 'image', source: { type: 'base64', media_type: file.mime, data: base64Data } },
+        { type: 'text', text: `${caption || 'Image file received.'}\n\n(saved to ${file.path})` },
       ];
-      await handleMessage(ctx, content, `[photo] ${caption.substring(0, 60)}`);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      console.error(`[telegram] photo error: ${message}`);
-      await ctx.reply(`Error processing photo: ${message}`).catch(() => {});
+      await handleMessage(ctx, content, `[document:image] ${(doc.file_name || 'image').substring(0, 60)}`);
+    } else {
+      const sizeKb = (file.buffer.length / 1024).toFixed(1);
+      const text = [
+        caption,
+        `File received: ${doc.file_name || 'unnamed'} (${sizeKb} KB, ${file.mime})`,
+        `Saved to: ${file.path}`,
+      ].filter(Boolean).join('\n');
+      await handleMessage(ctx, text, `[document] ${(doc.file_name || 'file').substring(0, 60)}`);
     }
-  });
+  }));
+
+  // --- Voice messages ---
+  bot.on('voice', mediaHandler('voice', async (ctx) => {
+    const channel = channelFor(ctx);
+    const voice = ctx.message.voice;
+    const file = await downloadTelegramFile(ctx, voice.file_id, channel, { ext: '.ogg' });
+
+    const duration = voice.duration;
+    const text = [
+      ctx.message.caption || '',
+      `Voice message received (${duration}s, ${(file.buffer.length / 1024).toFixed(1)} KB)`,
+      `Saved to: ${file.path}`,
+    ].filter(Boolean).join('\n');
+    await handleMessage(ctx, text, `[voice] ${duration}s`);
+  }));
+
+  // --- Audio files ---
+  bot.on('audio', mediaHandler('audio', async (ctx) => {
+    const channel = channelFor(ctx);
+    const audio = ctx.message.audio;
+    const ext = audio.file_name ? extFromUrl(audio.file_name) || '.mp3' : '.mp3';
+    const file = await downloadTelegramFile(ctx, audio.file_id, channel, {
+      fileName: audio.file_name || undefined,
+      ext,
+    });
+
+    const parts = [ctx.message.caption || ''];
+    if (audio.title) parts.push(`Title: ${audio.title}`);
+    if (audio.performer) parts.push(`Artist: ${audio.performer}`);
+    parts.push(`Audio file (${audio.duration}s, ${(file.buffer.length / 1024).toFixed(1)} KB, ${file.mime})`);
+    parts.push(`Saved to: ${file.path}`);
+
+    await handleMessage(ctx, parts.filter(Boolean).join('\n'), `[audio] ${(audio.title || audio.file_name || 'audio').substring(0, 60)}`);
+  }));
+
+  // --- Video files ---
+  bot.on('video', mediaHandler('video', async (ctx) => {
+    const channel = channelFor(ctx);
+    const video = ctx.message.video;
+    const ext = video.file_name ? extFromUrl(video.file_name) || '.mp4' : '.mp4';
+    const file = await downloadTelegramFile(ctx, video.file_id, channel, {
+      fileName: video.file_name || undefined,
+      ext,
+    });
+
+    const caption = ctx.message.caption || '';
+    const text = [
+      caption,
+      `Video received (${video.duration}s, ${video.width}x${video.height}, ${(file.buffer.length / 1024).toFixed(1)} KB)`,
+      `Saved to: ${file.path}`,
+    ].filter(Boolean).join('\n');
+    await handleMessage(ctx, text, `[video] ${(video.file_name || 'video').substring(0, 60)}`);
+  }));
+
+  // --- Video notes (circular video messages) ---
+  bot.on('video_note', mediaHandler('video_note', async (ctx) => {
+    const channel = channelFor(ctx);
+    const vn = ctx.message.video_note;
+    const file = await downloadTelegramFile(ctx, vn.file_id, channel, { ext: '.mp4' });
+
+    const text = [
+      `Video note received (${vn.duration}s, ${(file.buffer.length / 1024).toFixed(1)} KB)`,
+      `Saved to: ${file.path}`,
+    ].join('\n');
+    await handleMessage(ctx, text, `[video_note] ${vn.duration}s`);
+  }));
+
+  // --- Stickers ---
+  bot.on('sticker', mediaHandler('sticker', async (ctx) => {
+    const channel = channelFor(ctx);
+    const sticker = ctx.message.sticker;
+    const ext = sticker.is_animated ? '.tgs' : sticker.is_video ? '.webm' : '.webp';
+    const file = await downloadTelegramFile(ctx, sticker.file_id, channel, { ext });
+
+    const isStaticImage = !sticker.is_animated && !sticker.is_video;
+    if (isStaticImage) {
+      const base64Data = file.buffer.toString('base64');
+      const content: ContentBlock[] = [
+        { type: 'image', source: { type: 'base64', media_type: 'image/webp', data: base64Data } },
+        { type: 'text', text: `Sticker: ${sticker.emoji || ''} (set: ${sticker.set_name || 'unknown'})\n\n(saved to ${file.path})` },
+      ];
+      await handleMessage(ctx, content, `[sticker] ${sticker.emoji || sticker.set_name || 'sticker'}`);
+    } else {
+      const text = [
+        `Sticker received: ${sticker.emoji || ''} (${sticker.is_animated ? 'animated' : 'video'}, set: ${sticker.set_name || 'unknown'})`,
+        `Saved to: ${file.path}`,
+      ].join('\n');
+      await handleMessage(ctx, text, `[sticker] ${sticker.emoji || 'sticker'}`);
+    }
+  }));
+
+  // --- Animations (GIFs) ---
+  bot.on('animation', mediaHandler('animation', async (ctx) => {
+    const channel = channelFor(ctx);
+    const anim = ctx.message.animation;
+    const ext = anim.file_name ? extFromUrl(anim.file_name) || '.mp4' : '.mp4';
+    const file = await downloadTelegramFile(ctx, anim.file_id, channel, {
+      fileName: anim.file_name || undefined,
+      ext,
+    });
+
+    const caption = ctx.message.caption || '';
+    const text = [
+      caption,
+      `GIF/animation received (${anim.duration}s, ${anim.width}x${anim.height}, ${(file.buffer.length / 1024).toFixed(1)} KB)`,
+      `Saved to: ${file.path}`,
+    ].filter(Boolean).join('\n');
+    await handleMessage(ctx, text, `[animation] ${(anim.file_name || 'animation').substring(0, 60)}`);
+  }));
 
   const pushHandler: PushHandler = async (channel, text) => {
     const chatId = parseInt(channel.slice(3), 10);
