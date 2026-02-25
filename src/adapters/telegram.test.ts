@@ -14,6 +14,7 @@ import {
   mimeFromExt,
   extFromUrl,
   downloadTelegramFile,
+  inferMediaType,
 } from './telegram.js';
 
 describe('escapeHtml', () => {
@@ -452,5 +453,43 @@ describe('downloadTelegramFile', () => {
 
     await expect(downloadTelegramFile(ctx, 'f1', TEST_CHANNEL, { ext: '.bin' }))
       .rejects.toThrow(/too large/i);
+  });
+});
+
+describe('inferMediaType', () => {
+  it('maps image/gif to animation', () => {
+    expect(inferMediaType('image/gif')).toBe('animation');
+  });
+
+  it('maps image/* to photo', () => {
+    expect(inferMediaType('image/jpeg')).toBe('photo');
+    expect(inferMediaType('image/png')).toBe('photo');
+    expect(inferMediaType('image/webp')).toBe('photo');
+  });
+
+  it('maps video/* to video', () => {
+    expect(inferMediaType('video/mp4')).toBe('video');
+    expect(inferMediaType('video/webm')).toBe('video');
+  });
+
+  it('maps audio/ogg to voice', () => {
+    expect(inferMediaType('audio/ogg')).toBe('voice');
+  });
+
+  it('maps other audio/* to audio', () => {
+    expect(inferMediaType('audio/mpeg')).toBe('audio');
+    expect(inferMediaType('audio/wav')).toBe('audio');
+    expect(inferMediaType('audio/mp4')).toBe('audio');
+  });
+
+  it('maps application/x-tgsticker to sticker', () => {
+    expect(inferMediaType('application/x-tgsticker')).toBe('sticker');
+  });
+
+  it('maps everything else to document', () => {
+    expect(inferMediaType('application/pdf')).toBe('document');
+    expect(inferMediaType('application/zip')).toBe('document');
+    expect(inferMediaType('application/octet-stream')).toBe('document');
+    expect(inferMediaType('text/plain')).toBe('document');
   });
 });

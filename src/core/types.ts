@@ -45,11 +45,16 @@ export interface SendMessageRequest {
   channel?: string;
 }
 
+export interface PushMedia {
+  filePath: string;
+  type?: 'photo' | 'document' | 'audio' | 'voice' | 'video' | 'animation' | 'sticker' | 'video_note';
+}
+
 /**
  * Pushes a message to a user through an adapter's native protocol,
  * bypassing ProcessManager entirely. Registered by adapters at startup.
  */
-export type PushHandler = (channel: string, text: string) => Promise<boolean>;
+export type PushHandler = (channel: string, text: string, media?: PushMedia) => Promise<boolean>;
 
 export interface SendMessageResponse {
   text: string;

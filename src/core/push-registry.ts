@@ -1,4 +1,4 @@
-import type { PushHandler } from './types.js';
+import type { PushHandler, PushMedia } from './types.js';
 
 /**
  * Routes outbound messages to the correct adapter based on channel prefix.
@@ -14,10 +14,10 @@ export class PushRegistry {
     console.log(`[push-registry] registered handler for prefix: ${prefix}`);
   }
 
-  async send(channel: string, text: string): Promise<boolean> {
+  async send(channel: string, text: string, media?: PushMedia): Promise<boolean> {
     for (const [prefix, handler] of this.handlers) {
       if (channel.startsWith(prefix)) {
-        return handler(channel, text);
+        return handler(channel, text, media);
       }
     }
     return false;

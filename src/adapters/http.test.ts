@@ -131,7 +131,7 @@ describe('HTTP adapter', () => {
 
       const res = await request(app, '/send', { channel: 'tg-123', text: 'hi' });
       expect(res.status).toBe(200);
-      expect(push.send).toHaveBeenCalledWith('tg-123', 'hi');
+      expect(push.send).toHaveBeenCalledWith('tg-123', 'hi', undefined);
     });
 
     it('returns 400 for missing channel', async () => {
@@ -140,10 +140,46 @@ describe('HTTP adapter', () => {
       expect(res.status).toBe(400);
     });
 
-    it('returns 400 for missing text', async () => {
+    it('returns 400 when neither text nor media provided', async () => {
       const app = buildApp(makeConfig(), mockProcessManager(), mockPushRegistry());
       const res = await request(app, '/send', { channel: 'tg-123' });
       expect(res.status).toBe(400);
+      expect((res.body as { error: string }).error).toContain('text');
+    });
+
+    it('sends media with text caption', async () => {
+      const push = mockPushRegistry();
+      const app = buildApp(makeConfig(), mockProcessManager(), push);
+
+      const res = await request(app, '/send', {
+        channel: 'tg-123',
+        text: 'Here is the chart',
+        media: { filePath: '/tmp/chart.png' },
+      });
+      expect(res.status).toBe(200);
+      expect(push.send).toHaveBeenCalledWith('tg-123', 'Here is the chart', { filePath: '/tmp/chart.png' });
+    });
+
+    it('sends media without text', async () => {
+      const push = mockPushRegistry();
+      const app = buildApp(makeConfig(), mockProcessManager(), push);
+
+      const res = await request(app, '/send', {
+        channel: 'tg-123',
+        media: { filePath: '/tmp/doc.pdf' },
+      });
+      expect(res.status).toBe(200);
+      expect(push.send).toHaveBeenCalledWith('tg-123', '', { filePath: '/tmp/doc.pdf' });
+    });
+
+    it('returns 400 when media.filePath is missing', async () => {
+      const app = buildApp(makeConfig(), mockProcessManager(), mockPushRegistry());
+      const res = await request(app, '/send', {
+        channel: 'tg-123',
+        media: {},
+      });
+      expect(res.status).toBe(400);
+      expect((res.body as { error: string }).error).toContain('filePath');
     });
 
     it('returns 404 when no handler matches', async () => {

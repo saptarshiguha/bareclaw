@@ -10,7 +10,7 @@ describe('PushRegistry', () => {
     registry.register('slack-', slackHandler);
 
     await registry.send('tg-12345', 'hello');
-    expect(tgHandler).toHaveBeenCalledWith('tg-12345', 'hello');
+    expect(tgHandler).toHaveBeenCalledWith('tg-12345', 'hello', undefined);
     expect(slackHandler).not.toHaveBeenCalled();
   });
 
@@ -36,5 +36,24 @@ describe('PushRegistry', () => {
 
     const result = await registry.send('tg-123', 'hello');
     expect(result).toBe(false);
+  });
+
+  it('forwards media to handler', async () => {
+    const registry = new PushRegistry();
+    const handler = vi.fn().mockResolvedValue(true);
+    registry.register('tg-', handler);
+
+    const media = { filePath: '/tmp/chart.png' };
+    await registry.send('tg-123', 'caption', media);
+    expect(handler).toHaveBeenCalledWith('tg-123', 'caption', media);
+  });
+
+  it('works without media (backward compat)', async () => {
+    const registry = new PushRegistry();
+    const handler = vi.fn().mockResolvedValue(true);
+    registry.register('tg-', handler);
+
+    await registry.send('tg-123', 'hello');
+    expect(handler).toHaveBeenCalledWith('tg-123', 'hello', undefined);
   });
 });

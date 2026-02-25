@@ -1,7 +1,7 @@
 import express, { type Router, type Request, type Response, type NextFunction } from 'express';
 import type { Config } from '../config.js';
 import type { ProcessManager } from '../core/process-manager.js';
-import type { ChannelContext, SendMessageRequest } from '../core/types.js';
+import type { ChannelContext, PushMedia, SendMessageRequest } from '../core/types.js';
 import type { PushRegistry } from '../core/push-registry.js';
 
 export function createHttpAdapter(config: Config, processManager: ProcessManager, restart: () => void, pushRegistry: PushRegistry): Router {
@@ -49,21 +49,26 @@ export function createHttpAdapter(config: Config, processManager: ProcessManager
   });
 
   router.post('/send', async (req, res) => {
-    const { channel, text } = req.body as { channel?: string; text?: string };
+    const { channel, text, media } = req.body as { channel?: string; text?: string; media?: PushMedia };
 
     if (!channel || typeof channel !== 'string') {
       res.status(400).json({ error: 'Missing "channel" field' });
       return;
     }
-    if (!text || typeof text !== 'string') {
-      res.status(400).json({ error: 'Missing "text" field' });
+    if (media && (!media.filePath || typeof media.filePath !== 'string')) {
+      res.status(400).json({ error: 'media.filePath must be a string' });
+      return;
+    }
+    if (!text && !media) {
+      res.status(400).json({ error: 'Missing "text" or "media" field' });
       return;
     }
 
-    console.log(`[http] /send -> ${channel}: ${text.substring(0, 80)}${text.length > 80 ? '...' : ''}`);
+    const label = text ? text.substring(0, 80) + (text.length > 80 ? '...' : '') : `[media: ${media!.filePath}]`;
+    console.log(`[http] /send -> ${channel}: ${label}`);
 
     try {
-      const sent = await pushRegistry.send(channel, text);
+      const sent = await pushRegistry.send(channel, text || '', media);
       if (sent) {
         res.json({ status: 'sent', channel });
       } else {

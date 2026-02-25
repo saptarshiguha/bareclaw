@@ -64,6 +64,22 @@ curl -s -X POST localhost:3000/send \
 - Auth uses the same `BARECLAW_HTTP_TOKEN` as other endpoints.
 - This does NOT go through a Claude session — use it to notify users on other channels, not to respond to the current conversation.
 
+### Sending media
+
+You can send files (images, PDFs, audio, video, etc.) to users via `POST /send` by adding a `media` field. Write the file to disk first, then pass its path.
+
+```bash
+curl -s -X POST localhost:3000/send \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer TOKEN' \
+  -d '{"channel": "tg-CHAT_ID", "text": "Here is the chart", "media": {"filePath": "/tmp/chart.png"}}'
+```
+
+- `media.filePath` — absolute path to the file on disk (required).
+- `media.type` — optional override: `photo`, `document`, `audio`, `voice`, `video`, `animation`, `sticker`, `video_note`. If omitted, the type is inferred from the file extension.
+- `text` is optional when `media` is present (sent as a caption).
+- `text` without `media` sends a plain text message as before.
+
 ### Self-modification
 
 You can edit BAREclaw's own source code (in `src/`) and trigger a restart:

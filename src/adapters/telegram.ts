@@ -10,14 +10,14 @@
  * - Final result sent as the actual response
  * - Short filler text ("Let me check that") is suppressed
  */
-import { Telegraf } from 'telegraf';
+import { Telegraf, Input } from 'telegraf';
 import type { Context } from 'telegraf';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { Config } from '../config.js';
 import type { ProcessManager, MessageContent } from '../core/process-manager.js';
-import type { ChannelContext, ClaudeEvent, ContentBlock, PushHandler } from '../core/types.js';
+import type { ChannelContext, ClaudeEvent, ContentBlock, PushHandler, PushMedia } from '../core/types.js';
 
 const MAX_MESSAGE_LENGTH = 4096;
 const FILLER_MAX_LENGTH = 100;
@@ -299,6 +299,17 @@ export async function downloadTelegramFile(
   await writeFile(filePath, buffer);
 
   return { path: filePath, buffer, ext, mime };
+}
+
+/** Map a MIME type to the Telegram send method type */
+export function inferMediaType(mime: string): PushMedia['type'] {
+  if (mime === 'image/gif') return 'animation';
+  if (mime.startsWith('image/')) return 'photo';
+  if (mime.startsWith('video/')) return 'video';
+  if (mime === 'audio/ogg') return 'voice';
+  if (mime.startsWith('audio/')) return 'audio';
+  if (mime === 'application/x-tgsticker') return 'sticker';
+  return 'document';
 }
 
 export function createTelegramAdapter(config: Config, processManager: ProcessManager): { bot: Telegraf; pushHandler: PushHandler } {
@@ -619,18 +630,48 @@ export function createTelegramAdapter(config: Config, processManager: ProcessMan
     await handleMessage(ctx, text, `[animation] ${(anim.file_name || 'animation').substring(0, 60)}`);
   }));
 
-  const pushHandler: PushHandler = async (channel, text) => {
+  /** Send a media file to a Telegram chat */
+  async function sendMedia(chatId: number, media: PushMedia, caption?: string): Promise<void> {
+    const ext = extFromUrl(media.filePath);
+    const mime = mimeFromExt(ext);
+    const type = media.type || inferMediaType(mime);
+    const file = Input.fromLocalFile(media.filePath);
+    const extra = caption ? { caption, parse_mode: 'HTML' as const } : undefined;
+
+    switch (type) {
+      case 'photo':      await bot.telegram.sendPhoto(chatId, file, extra); break;
+      case 'animation':  await bot.telegram.sendAnimation(chatId, file, extra); break;
+      case 'video':      await bot.telegram.sendVideo(chatId, file, extra); break;
+      case 'voice':      await bot.telegram.sendVoice(chatId, file, extra); break;
+      case 'audio':      await bot.telegram.sendAudio(chatId, file, extra); break;
+      case 'sticker':    await bot.telegram.sendSticker(chatId, file); break;
+      case 'video_note': await bot.telegram.sendVideoNote(chatId, file as Exclude<typeof file, { url: string }>); break;
+      case 'document':
+      default:           await bot.telegram.sendDocument(chatId, file, extra); break;
+    }
+  }
+
+  const pushHandler: PushHandler = async (channel, text, media?) => {
     const chatId = parseInt(channel.slice(3), 10);
     if (!Number.isFinite(chatId)) {
       console.error(`[telegram] invalid chat ID in channel: ${channel}`);
       return false;
     }
     try {
-      for (const chunk of splitText(text)) {
-        await bot.telegram.sendMessage(chatId, chunk, { parse_mode: 'HTML' })
-          .catch(() => bot.telegram.sendMessage(chatId, chunk.replace(/<[^>]*>/g, '')));
+      if (media) {
+        await sendMedia(chatId, media, text || undefined);
+        console.log(`[telegram] push media -> ${channel}: ${media.filePath}`);
       }
-      console.log(`[telegram] push -> ${channel}: ${text.substring(0, 80)}${text.length > 80 ? '...' : ''}`);
+      if (text && !media) {
+        for (const chunk of splitText(text)) {
+          await bot.telegram.sendMessage(chatId, chunk, { parse_mode: 'HTML' })
+            .catch(() => bot.telegram.sendMessage(chatId, chunk.replace(/<[^>]*>/g, '')));
+        }
+      }
+      if (text || media) {
+        const label = text ? text.substring(0, 80) + (text.length > 80 ? '...' : '') : `[media]`;
+        console.log(`[telegram] push -> ${channel}: ${label}`);
+      }
       return true;
     } catch (err) {
       console.error(`[telegram] push failed for ${channel}: ${err instanceof Error ? err.message : err}`);
