@@ -76,6 +76,7 @@ function spawnClaude() {
     '--verbose',
     '--max-turns', String(config.maxTurns),
     '--allowedTools', config.allowedTools,
+    '--dangerously-skip-permissions',
   ];
   if (lastSessionId) {
     args.push('--resume', lastSessionId);
