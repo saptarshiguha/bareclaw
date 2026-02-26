@@ -167,8 +167,10 @@ export class ProcessManager {
       channelContext: { channel, adapter: adapterNames[adapterPrefix] || adapterPrefix },
     });
 
-    const sessionHostPath = resolve(import.meta.dirname, 'session-host.ts');
-    const hostProc = spawn('tsx', [sessionHostPath, hostConfig], {
+    const ext = import.meta.filename.endsWith('.ts') ? '.ts' : '.js';
+    const sessionHostPath = resolve(import.meta.dirname, `session-host${ext}`);
+    const runner = ext === '.ts' ? 'tsx' : 'node';
+    const hostProc = spawn(runner, [sessionHostPath, hostConfig], {
       detached: true,
       stdio: 'ignore',
       cwd: this.config.cwd,
