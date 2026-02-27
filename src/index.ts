@@ -1,6 +1,7 @@
-import { spawn, execFileSync } from 'child_process';
+import { spawn, execFileSync, execSync } from 'child_process';
 import { existsSync } from 'fs';
 import { resolve } from 'path';
+import { homedir } from 'os';
 import express from 'express';
 import { loadConfig } from './config.js';
 import { ProcessManager } from './core/process-manager.js';
@@ -24,6 +25,65 @@ function ensureHeartbeat(): void {
   }
 }
 ensureHeartbeat();
+
+// Ensure WhatsApp daemon is running (Baileys WebSocket bridge)
+function ensureWhatsAppDaemon(): void {
+  const daemonDir = resolve(homedir(), '.claude', 'skills', 'whatsapp', 'scripts', 'daemon');
+  if (!existsSync(resolve(daemonDir, 'index.ts'))) return;
+
+  // Read port from config.env if available
+  let port = '3001';
+  const configPath = resolve(homedir(), '.claude', 'skills', 'whatsapp', 'scripts', 'config.env');
+  if (existsSync(configPath)) {
+    try {
+      const configContent = execSync(`grep WHATSAPP_DAEMON_PORT ${configPath} 2>/dev/null || true`, { encoding: 'utf8' });
+      const match = configContent.match(/WHATSAPP_DAEMON_PORT=(\d+)/);
+      if (match) port = match[1]!;
+    } catch { /* use default */ }
+  }
+
+  // Check if already running
+  try {
+    execSync(`curl -sf --max-time 2 http://localhost:${port}/health`, { stdio: 'pipe' });
+    console.log(`[bareclaw] WhatsApp daemon already running on :${port}`);
+    return;
+  } catch { /* not running, start it */ }
+
+  // Check if npm install has been run
+  if (!existsSync(resolve(daemonDir, 'node_modules'))) {
+    console.log('[bareclaw] WhatsApp daemon: running npm install...');
+    try {
+      execSync('npm install', { cwd: daemonDir, stdio: 'pipe' });
+    } catch (err) {
+      console.error(`[bareclaw] WhatsApp daemon npm install failed: ${err instanceof Error ? err.message : err}`);
+      return;
+    }
+  }
+
+  try {
+    const child = spawn('npx', ['tsx', 'index.ts'], {
+      cwd: daemonDir,
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, WHATSAPP_DAEMON_PORT: port },
+    });
+
+    child.stdout?.on('data', (data: Buffer) => {
+      const line = data.toString().trim();
+      if (line) console.log(`[whatsapp] ${line}`);
+    });
+    child.stderr?.on('data', (data: Buffer) => {
+      const line = data.toString().trim();
+      if (line) console.error(`[whatsapp] ${line}`);
+    });
+
+    child.unref();
+    console.log(`[bareclaw] WhatsApp daemon starting on :${port} (pid ${child.pid})`);
+  } catch (err) {
+    console.error(`[bareclaw] WhatsApp daemon start failed: ${err instanceof Error ? err.message : err}`);
+  }
+}
+ensureWhatsAppDaemon();
 
 // Self-restart: shut down everything, re-exec the same process
 function restart() {
