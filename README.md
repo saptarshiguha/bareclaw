@@ -247,11 +247,66 @@ Edit `heartbeat/heartbeat.sh` to change the heartbeat message. Edit the interval
 
 Logs: `/tmp/bareclaw-heartbeat.log`.
 
-## WhatsApp integration
+## Skills
 
-BAREclaw includes a WhatsApp skill powered by [Baileys](https://github.com/WhiskeySockets/Baileys) — a lightweight Node.js library that connects to WhatsApp via WebSocket (no browser needed).
+BAREclaw sessions have access to skills defined in `~/.claude/skills/`. Each skill has a `SKILL.md` with trigger words, allowed tools, and usage docs. Skills are automatically available to all channels.
 
-### Architecture
+### Google (Gmail, Calendar, Contacts, Tasks)
+
+Python scripts using the Google APIs, run via `uv run --script` (no pip install needed — dependencies declared inline via PEP 723).
+
+**First-time setup:**
+
+1. Create a [Google Cloud project](https://console.cloud.google.com) and enable the **Gmail**, **People**, **Calendar**, and **Tasks** APIs
+2. Configure the **OAuth consent screen** (External, add yourself as a test user) with these scopes:
+   - `gmail.readonly`, `gmail.compose`, `contacts.readonly`, `calendar`, `tasks`
+3. Create **OAuth credentials** (Desktop app) and download the JSON to:
+   ```
+   ~/.claude/skills/google_info/scripts/credentials.json
+   ```
+4. Run any script to trigger the browser-based OAuth flow:
+   ```bash
+   uv run --script ~/.claude/skills/google_info/scripts/google_gmail_read.py search --query "is:unread" --max 1
+   ```
+5. Token saves to `token.json` — subsequent runs use it automatically
+
+**Note:** Tokens for apps in "Testing" status expire after 7 days. To get persistent tokens, publish the app in the OAuth consent screen (requires Google verification).
+
+See `~/.claude/skills/google_info/references/setup.md` for detailed steps and troubleshooting.
+
+### Signal
+
+Send and receive Signal messages via `signal-cli` (a Java-based CLI for the Signal protocol).
+
+**First-time setup:**
+
+```bash
+# Install signal-cli
+brew install signal-cli
+
+# Link as a device (like Signal Desktop)
+signal-cli link -n "claude-code" | tee >(qrencode -t ANSIUTF8)
+# Scan QR with Signal > Settings > Linked Devices
+
+# Save your phone number
+echo 'SIGNAL_ACCOUNT=+1XXXXXXXXXX' > ~/.claude/skills/signal/scripts/config.env
+```
+
+**Usage:**
+```bash
+~/.claude/skills/signal/scripts/signal.sh receive           # read messages
+~/.claude/skills/signal/scripts/signal.sh send --to "+1..." --message "Hello"
+~/.claude/skills/signal/scripts/signal.sh list-groups
+~/.claude/skills/signal/scripts/signal.sh list-contacts
+```
+
+See `~/.claude/skills/signal/references/setup.md` for detailed steps and troubleshooting.
+
+### WhatsApp
+
+[Baileys](https://github.com/WhiskeySockets/Baileys)-based WhatsApp integration — a lightweight Node.js library that connects via WebSocket (no browser needed).
+
+#### Architecture
 
 A persistent Node.js daemon maintains the WhatsApp connection and exposes an HTTP API on `localhost:3001`. A bash wrapper (`whatsapp.sh`) calls the daemon's API, matching the existing Signal skill pattern. BAREclaw auto-starts the daemon on boot via `ensureWhatsAppDaemon()` in `src/index.ts`.
 
@@ -260,7 +315,7 @@ whatsapp.sh  ──HTTP──▶  whatsapp-daemon (Baileys)  ──WebSocket─�
                          localhost:3001
 ```
 
-### First-time setup
+**First-time setup:**
 
 ```bash
 # Install dependencies
@@ -274,9 +329,7 @@ npx tsx index.ts
 
 Auth credentials persist in `auth_info/` — you only scan once.
 
-### Usage
-
-After the initial QR scan, `npm run dev` starts the daemon automatically alongside everything else.
+**Usage** (after initial QR scan, `npm run dev` starts the daemon automatically):
 
 ```bash
 # Check connection status
@@ -295,7 +348,7 @@ After the initial QR scan, `npm run dev` starts the daemon automatically alongsi
 ~/.claude/skills/whatsapp/scripts/whatsapp.sh send-group --group "GROUP_JID" --message "Hello"
 ```
 
-### Files
+**Files:**
 
 ```
 ~/.claude/skills/whatsapp/
@@ -311,7 +364,7 @@ After the initial QR scan, `npm run dev` starts the daemon automatically alongsi
     setup.md                        # Detailed setup and troubleshooting guide
 ```
 
-### Limitations
+**Limitations:**
 
 - Messages are only buffered while the daemon is running (no historical fetch)
 - Up to 200 recent messages stored in memory
