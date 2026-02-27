@@ -247,6 +247,77 @@ Edit `heartbeat/heartbeat.sh` to change the heartbeat message. Edit the interval
 
 Logs: `/tmp/bareclaw-heartbeat.log`.
 
+## WhatsApp integration
+
+BAREclaw includes a WhatsApp skill powered by [Baileys](https://github.com/WhiskeySockets/Baileys) — a lightweight Node.js library that connects to WhatsApp via WebSocket (no browser needed).
+
+### Architecture
+
+A persistent Node.js daemon maintains the WhatsApp connection and exposes an HTTP API on `localhost:3001`. A bash wrapper (`whatsapp.sh`) calls the daemon's API, matching the existing Signal skill pattern. BAREclaw auto-starts the daemon on boot via `ensureWhatsAppDaemon()` in `src/index.ts`.
+
+```
+whatsapp.sh  ──HTTP──▶  whatsapp-daemon (Baileys)  ──WebSocket──▶  WhatsApp
+                         localhost:3001
+```
+
+### First-time setup
+
+```bash
+# Install dependencies
+cd ~/.claude/skills/whatsapp/scripts/daemon && npm install
+
+# Start daemon and scan QR code
+npx tsx index.ts
+# Scan the QR with WhatsApp > Settings > Linked Devices > Link a Device
+# Wait for "connected to WhatsApp", then Ctrl+C
+```
+
+Auth credentials persist in `auth_info/` — you only scan once.
+
+### Usage
+
+After the initial QR scan, `npm run dev` starts the daemon automatically alongside everything else.
+
+```bash
+# Check connection status
+~/.claude/skills/whatsapp/scripts/whatsapp.sh status
+
+# List groups
+~/.claude/skills/whatsapp/scripts/whatsapp.sh list-groups
+
+# Read recent messages (buffered while daemon is running)
+~/.claude/skills/whatsapp/scripts/whatsapp.sh receive
+
+# Send a message
+~/.claude/skills/whatsapp/scripts/whatsapp.sh send --to "+14155551234" --message "Hello"
+
+# Send to a group
+~/.claude/skills/whatsapp/scripts/whatsapp.sh send-group --group "GROUP_JID" --message "Hello"
+```
+
+### Files
+
+```
+~/.claude/skills/whatsapp/
+  SKILL.md                          # Skill definition (triggers, allowed-tools)
+  scripts/
+    whatsapp.sh                     # Bash CLI wrapper (calls daemon HTTP API)
+    config.env                      # Port and account config (gitignored)
+    daemon/
+      index.ts                      # Baileys daemon with HTTP server
+      package.json                  # Dependencies: baileys, pino, qrcode-terminal
+      auth_info/                    # WhatsApp auth credentials (gitignored)
+  references/
+    setup.md                        # Detailed setup and troubleshooting guide
+```
+
+### Limitations
+
+- Messages are only buffered while the daemon is running (no historical fetch)
+- Up to 200 recent messages stored in memory
+- WhatsApp may unlink devices after ~14 days of inactivity — re-scan QR if needed
+- Contacts list is built from received messages (WhatsApp doesn't expose full contacts to linked devices)
+
 ## Telegram setup
 
 1. Message [@BotFather](https://t.me/BotFather) on Telegram and create a new bot. Copy the token.
